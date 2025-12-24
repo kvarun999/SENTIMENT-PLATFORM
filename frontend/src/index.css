@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* You can keep your custom body styles if you want, but Tailwind handles most of it */
+body {
+  background-color: #111827;
+  color: white;
+}
