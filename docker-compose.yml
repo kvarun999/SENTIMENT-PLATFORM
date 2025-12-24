@@ -1,0 +1,93 @@
+services:
+  # Service 1: Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: sentiment_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sentiment_network
+
+  # Service 2: Message Queue
+  redis:
+    image: redis:7-alpine
+    container_name: sentiment_redis
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sentiment_network
+
+  # Service 3: Backend API
+  backend:
+    build: ./backend
+    container_name: sentiment_backend
+    ports:
+      - "${API_PORT}:8000"
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - sentiment_network
+
+  # Service 4: AI Worker
+  worker:
+    build: ./worker
+    container_name: sentiment_worker
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      backend: # Worker often depends on backend to initialize schemas first
+        condition: service_started
+    networks:
+      - sentiment_network
+
+  # Service 5: Data Ingester
+  ingester:
+    build: ./ingester
+    container_name: sentiment_ingester
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - sentiment_network
+
+  # Service 6: Frontend Dashboard
+  frontend:
+    build: ./frontend
+    container_name: sentiment_frontend
+    ports:
+      - "${FRONTEND_PORT}:3000"
+    environment:
+      - VITE_API_URL=http://localhost:${API_PORT}
+    depends_on:
+      backend:
+        condition: service_started
+    networks:
+      - sentiment_network
+
+volumes:
+  postgres_data:
+
+networks:
+  sentiment_network:
+    driver: bridge
