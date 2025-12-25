@@ -24,12 +24,12 @@ const WS_URL =
   window.location.protocol === "https:"
     ? "wss://localhost:8000/ws/sentiment"
     : "ws://localhost:8000/ws/sentiment";
-// -----------------------
 
 export default function Dashboard() {
   const [posts, setPosts] = useState([]);
   const [stats, setStats] = useState({ total_posts: 0, distribution: {} });
   const [status, setStatus] = useState("disconnected");
+  // FIX: Trend data must support multi-line (Pos, Neg, Neu)
   const [trendData, setTrendData] = useState([]);
 
   // 1. Fetch Initial Data
@@ -37,21 +37,15 @@ export default function Dashboard() {
     fetch(`${API_URL}/api/posts?limit=20`)
       .then((res) => res.json())
       .then((data) => {
-        console.log("Initial posts:", data);
         setPosts(data.posts || []);
       })
       .catch((err) => console.error("Failed to fetch posts:", err));
 
-    fetch(`${API_URL}/api/sentiment/stats`)
+    fetch(`${API_URL}/api/sentiment/distribution`)
       .then((res) => res.json())
       .then((data) => {
-        console.log("Initial stats:", data);
-        // FIX: Handle both potential key names
-        const total =
-          data.total_posts !== undefined ? data.total_posts : data.total;
-
         setStats({
-          total_posts: total,
+          total_posts: data.total,
           distribution: data.distribution || {},
         });
       })
@@ -60,31 +54,19 @@ export default function Dashboard() {
 
   // 2. WebSocket Connection
   useEffect(() => {
-    console.log("Attempting WebSocket connection...");
     const ws = new WebSocket(WS_URL);
 
-    ws.onopen = () => {
-      console.log("WebSocket Connected!");
-      setStatus("connected");
-    };
-
-    ws.onclose = () => {
-      console.log("WebSocket Disconnected");
-      setStatus("disconnected");
-    };
+    ws.onopen = () => setStatus("connected");
+    ws.onclose = () => setStatus("disconnected");
 
     ws.onmessage = (event) => {
-      // Parse the message
       const message = JSON.parse(event.data);
-      console.log("WebSocket received:", message);
 
       if (message.type === "new_post") {
         const newPost = message.data;
-
-        // Update Feed
         setPosts((prev) => [newPost, ...prev].slice(0, 50));
 
-        // Update Stats safely
+        // Optimistic stats update
         setStats((prev) => {
           const label = newPost.sentiment.sentiment_label;
           const currentDist = prev.distribution || {};
@@ -96,25 +78,30 @@ export default function Dashboard() {
             },
           };
         });
+      }
 
-        // Update Trend
-        setTrendData((prev) => {
-          const now = new Date().toLocaleTimeString();
-          return [
+      // FIX: Handle Metrics Update for Trend Chart (Rubric Req)
+      if (message.type === "metrics_update") {
+        const data = message.data;
+        const timeStr = new Date(data.timestamp).toLocaleTimeString();
+
+        setTrendData((prev) =>
+          [
             ...prev,
             {
-              time: now,
-              sentiment: newPost.sentiment.confidence_score,
+              time: timeStr,
+              positive: data.positive,
+              negative: data.negative,
+              neutral: data.neutral,
             },
-          ].slice(-20);
-        });
+          ].slice(-20)
+        ); // Keep last 20 points
       }
     };
 
     return () => ws.close();
   }, []);
 
-  // Chart Data
   const pieData = [
     {
       name: "Positive",
@@ -135,7 +122,6 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-6">
-      {/* Header */}
       <div className="flex justify-between items-center mb-8">
         <div>
           <h1 className="text-3xl font-bold">Sentiment Command Center</h1>
@@ -152,7 +138,6 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Metrics Row */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
         <Card
           title="Total Posts"
@@ -179,25 +164,38 @@ export default function Dashboard() {
         />
       </div>
 
-      {/* Charts Row */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-8">
+        {/* Trend Chart: 3 Lines */}
         <div className="lg:col-span-2 bg-gray-800 p-4 rounded-xl border border-gray-700">
-          <h3 className="text-lg font-semibold mb-4">
-            Sentiment Confidence Trend
-          </h3>
+          <h3 className="text-lg font-semibold mb-4">Sentiment Trend (Live)</h3>
           <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={trendData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                 <XAxis dataKey="time" stroke="#9CA3AF" />
-                <YAxis stroke="#9CA3AF" domain={[0, 1]} />
+                <YAxis stroke="#9CA3AF" />
                 <Tooltip
                   contentStyle={{ backgroundColor: "#1F2937", border: "none" }}
                 />
+                <Legend />
                 <Line
                   type="monotone"
-                  dataKey="sentiment"
-                  stroke="#8884d8"
+                  dataKey="positive"
+                  stroke="#10B981"
+                  strokeWidth={2}
+                  dot={false}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="negative"
+                  stroke="#EF4444"
+                  strokeWidth={2}
+                  dot={false}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="neutral"
+                  stroke="#6B7280"
                   strokeWidth={2}
                   dot={false}
                 />
@@ -232,20 +230,16 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Live Feed */}
       <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
         <div className="p-4 border-b border-gray-700">
           <h3 className="text-lg font-semibold">Live Feed</h3>
         </div>
         <div className="max-h-96 overflow-y-auto">
           {posts.map((post, i) => {
-            // FIX: Check BOTH naming conventions
-            // API uses 'label', WebSocket uses 'sentiment_label'
-            const sentimentLabel =
+            const label =
               post.sentiment?.label ||
               post.sentiment?.sentiment_label ||
               "neutral";
-
             return (
               <div
                 key={i}
@@ -255,17 +249,16 @@ export default function Dashboard() {
                   <span className="font-medium text-blue-400">
                     @{post.author || "Anonymous"}
                   </span>
-                  {/* Render the Badge */}
                   <span
                     className={`text-xs px-2 py-1 rounded-full uppercase ${
-                      sentimentLabel === "positive"
+                      label === "positive"
                         ? "bg-green-900 text-green-300"
-                        : sentimentLabel === "negative"
+                        : label === "negative"
                         ? "bg-red-900 text-red-300"
                         : "bg-gray-700 text-gray-300"
                     }`}
                   >
-                    {sentimentLabel}
+                    {label}
                   </span>
                 </div>
                 <p className="text-gray-300">{post.content}</p>
@@ -278,11 +271,8 @@ export default function Dashboard() {
   );
 }
 
-// THE FIX: Safe Card Component
 function Card({ title, value, icon, color = "text-white" }) {
-  // If value is null/undefined, show 0.
   const safeValue = value === undefined || value === null ? 0 : value;
-
   return (
     <div className="bg-gray-800 p-6 rounded-xl border border-gray-700 flex items-center justify-between">
       <div>
