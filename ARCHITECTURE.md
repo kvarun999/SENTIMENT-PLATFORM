@@ -27,3 +27,15 @@ The system follows an Event-Driven Microservices Architecture composed of 6 cont
 - **Redis Streams**: Selected for at-least-once delivery guarantees via Consumer Groups.
 - **PostgreSQL**: Required for complex relational queries and time-series aggregation (`date_trunc`).
 - **Hugging Face**: Local inference avoids external API costs and latency.
+
+```mermaid
+graph TD
+    A[Ingester] -->|Writes to Stream| B(Redis)
+    B -->|Consumer Group| C[Worker]
+    C -->|Save Data| D[(PostgreSQL)]
+    C -->|PubSub Update| B
+    E[Backend API] -->|Read Data| D
+    E -->|Subscribe| B
+    F[Frontend] -->|WebSocket| E
+    F -->|REST API| E
+```
