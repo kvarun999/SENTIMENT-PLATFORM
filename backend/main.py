@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, func, desc, text
+from sqlalchemy import select, func, desc, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine, Base, get_db
@@ -43,7 +43,7 @@ manager = ConnectionManager()
 
 # --- Background Tasks ---
 async def redis_listener():
-    """Listens to Redis and broadcasts to WebSockets"""
+    """Listens to Redis and broadcasts new posts to WebSockets"""
     r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
     pubsub = r.pubsub()
     await pubsub.subscribe(REDIS_CHANNEL)
@@ -69,7 +69,47 @@ async def alert_loop():
         except Exception as e:
             print(f"❌ Alert Loop Error: {e}")
 
+async def metrics_broadcaster():
+    """
+    Rubric Req: Periodic metrics update (Type 3)
+    Broadcasts aggregated stats every 30 seconds.
+    """
+    print("✅ Backend: Metrics Broadcaster Started...")
+    while True:
+        try:
+            await asyncio.sleep(30)
+            async with AsyncSessionLocal() as db:
+                # Calculate last minute stats
+                now = datetime.utcnow()
+                one_min_ago = now - timedelta(minutes=1)
+                
+                query = (
+                    select(SentimentAnalysis.sentiment_label, func.count(SentimentAnalysis.id))
+                    .where(SentimentAnalysis.analyzed_at >= one_min_ago)
+                    .group_by(SentimentAnalysis.sentiment_label)
+                )
+                result = await db.execute(query)
+                stats = {row[0]: row[1] for row in result.all()}
+                
+                # Format for Frontend Trend Chart
+                msg = {
+                    "type": "metrics_update",
+                    "data": {
+                        "timestamp": now.isoformat(),
+                        "positive": stats.get("positive", 0),
+                        "negative": stats.get("negative", 0),
+                        "neutral": stats.get("neutral", 0)
+                    }
+                }
+                await manager.broadcast(json.dumps(msg))
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"❌ Metrics Loop Error: {e}")
+
 # --- LifeCycle ---
+from database import AsyncSessionLocal # Import here for background task
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 1. Initialize DB
@@ -79,6 +119,7 @@ async def lifespan(app: FastAPI):
     # 2. Start Background Services
     task_redis = asyncio.create_task(redis_listener())
     task_alert = asyncio.create_task(alert_loop())
+    task_metrics = asyncio.create_task(metrics_broadcaster())
     
     print("🚀 System Startup Complete.")
     yield
@@ -86,6 +127,7 @@ async def lifespan(app: FastAPI):
     # 3. Cleanup
     task_redis.cancel()
     task_alert.cancel()
+    task_metrics.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -103,10 +145,13 @@ app.add_middleware(
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
-        # Send confirmation message
-        await websocket.send_json({"type": "connected", "message": "Connected to sentiment stream"})
+        # Rubric Req: Connection Confirmation
+        await websocket.send_json({
+            "type": "connected", 
+            "message": "Connected to sentiment stream",
+            "timestamp": datetime.utcnow().isoformat()
+        })
         while True:
-            # Keep-alive loop
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
@@ -118,24 +163,33 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/api/health")
 async def health_check():
     """Health check for Docker Compose"""
-    return {"status": "healthy", "service": "backend"}
+    return {
+        "status": "healthy", 
+        "service": "backend",
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
 @app.get("/api/posts")
 async def get_posts(
-    limit: int = 50, 
+    limit: int = Query(50, ge=1, le=100), 
+    offset: int = Query(0, ge=0),
     source: Optional[str] = None,
+    sentiment: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Retrieve recent posts with joins"""
+    """Retrieve posts with filtering and pagination"""
     query = (
         select(SocialMediaPost, SentimentAnalysis)
         .join(SentimentAnalysis, SocialMediaPost.post_id == SentimentAnalysis.post_id)
         .order_by(desc(SocialMediaPost.created_at))
         .limit(limit)
+        .offset(offset)
     )
     
     if source:
         query = query.where(SocialMediaPost.source == source)
+    if sentiment:
+        query = query.where(SentimentAnalysis.sentiment_label == sentiment)
 
     result = await db.execute(query)
     
@@ -153,38 +207,56 @@ async def get_posts(
                 "emotion": analysis.emotion
             }
         })
-    return {"posts": posts}
+    return {"posts": posts, "limit": limit, "offset": offset}
 
-@app.get("/api/sentiment/stats")
-async def get_stats(db: AsyncSession = Depends(get_db)):
-    """General Dashboard Stats"""
-    # 1. Total Count
-    total_q = select(func.count(SocialMediaPost.id))
-    total_res = await db.execute(total_q)
-    total = total_res.scalar()
-
-    # 2. Distribution
-    dist_q = (
+@app.get("/api/sentiment/distribution")
+async def get_sentiment_distribution(
+    hours: int = Query(24, ge=1, le=168),
+    source: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Rubric Req: Distribution Endpoint
+    Gets sentiment counts for the last N hours.
+    """
+    threshold = datetime.utcnow() - timedelta(hours=hours)
+    
+    query = (
         select(SentimentAnalysis.sentiment_label, func.count(SentimentAnalysis.id))
-        .group_by(SentimentAnalysis.sentiment_label)
+        .join(SocialMediaPost, SentimentAnalysis.post_id == SocialMediaPost.post_id)
+        .where(SentimentAnalysis.analyzed_at >= threshold)
     )
-    dist_res = await db.execute(dist_q)
+    
+    if source:
+        query = query.where(SocialMediaPost.source == source)
+        
+    query = query.group_by(SentimentAnalysis.sentiment_label)
+    
+    result = await db.execute(query)
+    distribution = {row[0]: row[1] for row in result.all()}
     
     return {
-        "total_posts": total,
-        "distribution": {row[0]: row[1] for row in dist_res.all()}
+        "timeframe_hours": hours,
+        "distribution": distribution,
+        "total": sum(distribution.values())
     }
+
+# Alias for dashboard compatibility if needed, but distribution is the strict rubric name
+@app.get("/api/sentiment/stats")
+async def get_stats(db: AsyncSession = Depends(get_db)):
+    return await get_sentiment_distribution(hours=24, source=None, db=db)
 
 @app.get("/api/sentiment/aggregate")
 async def get_aggregate(
     period: str = Query("hour", regex="^(minute|hour|day)$"),
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    source: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
     """
     Time-Series Aggregation (Required for Rubric Phase 4)
-    Uses PostgreSQL 'date_trunc' to group data.
     """
-    # Truncate timestamp based on period (hour/day/minute)
     trunc_date = func.date_trunc(period, SentimentAnalysis.analyzed_at).label('timestamp')
     
     query = (
@@ -193,14 +265,24 @@ async def get_aggregate(
             SentimentAnalysis.sentiment_label,
             func.count(SentimentAnalysis.id)
         )
+        .join(SocialMediaPost, SentimentAnalysis.post_id == SocialMediaPost.post_id)
+    )
+
+    if start_date:
+        query = query.where(SentimentAnalysis.analyzed_at >= start_date)
+    if end_date:
+        query = query.where(SentimentAnalysis.analyzed_at <= end_date)
+    if source:
+        query = query.where(SocialMediaPost.source == source)
+
+    query = (
+        query
         .group_by(trunc_date, SentimentAnalysis.sentiment_label)
         .order_by(trunc_date)
-        .limit(100)
     )
     
     result = await db.execute(query)
     
-    # Process into readable format
     data = []
     for row in result:
         data.append({
