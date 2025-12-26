@@ -19,11 +19,8 @@ import {
   AlertTriangle,
 } from "lucide-react";
 
-const API_URL = "http://localhost:8000";
-const WS_URL =
-  window.location.protocol === "https:"
-    ? "wss://localhost:8000/ws/sentiment"
-    : "ws://localhost:8000/ws/sentiment";
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const WS_URL = API_URL.replace(/^http/, "ws") + "/ws/sentiment";
 
 export default function Dashboard() {
   const [posts, setPosts] = useState([]);
