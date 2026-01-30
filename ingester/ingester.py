@@ -1,80 +1,70 @@
 import os
 import time
 import json
-import random
+import asyncio
 import uuid
-import redis
+import random
+import redis.asyncio as redis
 from datetime import datetime
-from faker import Faker
 
-# 1. Configuration
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-STREAM_NAME = os.getenv("REDIS_STREAM_NAME", "social_posts_stream")
+class DataIngester:
+    """
+    Publishes simulated social media posts to Redis Stream
+    """
+    def __init__(self, redis_client, stream_name: str, posts_per_minute: int = 60):
+        self.redis = redis_client
+        self.stream_name = stream_name
+        self.posts_per_minute = posts_per_minute
+        self.products = ["iPhone 16", "Tesla Model 3", "ChatGPT", "Netflix", "Amazon Prime"]
+        self.authors = ["alex_99", "tech_guru", "user_123", "morning_star", "pixel_fan"]
 
-# 2. Initialize Faker and Redis
-fake = Faker()
-try:
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-    # Test connection
-    r.ping()
-    print(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
-except Exception as e:
-    print(f"Failed to connect to Redis: {e}")
-    exit(1)
+    def generate_post(self) -> dict:
+        product = random.choice(self.products)
+        roll = random.random()
+        
+        if roll < 0.4: # Positive
+            content = f"I absolutely love the {product}! This is amazing and exceeded my expectations."
+        elif roll < 0.7: # Neutral
+            content = f"Just tried the {product}. It is what it is. Received it today."
+        else: # Negative
+            content = f"Very disappointed with the {product}. Terrible experience, would not recommend."
 
-# 3. Data Templates (to make it look real)
-PRODUCTS = ["iPhone 16", "Tesla Model 3", "Netflix", "ChatGPT", "Pixel 8", "AWS"]
-POSITIVE_ADJECTIVES = ["amazing", "love", "great", "excellent", "superb"]
-NEGATIVE_ADJECTIVES = ["terrible", "hate", "awful", "worst", "disappointed"]
+        return {
+            'post_id': f"post_{uuid.uuid4().hex[:10]}",
+            'source': random.choice(['reddit', 'twitter']),
+            'content': content,
+            'author': random.choice(self.authors),
+            'created_at': datetime.utcnow().isoformat() + "Z"
+        }
 
-def generate_post():
-    """Generates a realistic fake social media post"""
-    product = random.choice(PRODUCTS)
-    
-    # Simple logic to generate sentiment-biased text
-    sentiment_type = random.choice(["positive", "negative", "neutral"])
-    
-    if sentiment_type == "positive":
-        adj = random.choice(POSITIVE_ADJECTIVES)
-        content = f"I just got the new {product} and it is {adj}! Highly recommend."
-    elif sentiment_type == "negative":
-        adj = random.choice(NEGATIVE_ADJECTIVES)
-        content = f"My experience with {product} has been {adj}. Do not buy."
-    else:
-        content = f"Just saw an ad for {product}. wondering if it's any good."
-
-    return {
-        "post_id": str(uuid.uuid4()),
-        "source": random.choice(["twitter", "reddit", "facebook"]),
-        "author": fake.user_name(),
-        "content": content,
-        "created_at": datetime.utcnow().isoformat()
-    }
-
-def start_ingestion():
-    """Main loop to publish posts"""
-    print(f"Starting ingestion to stream: {STREAM_NAME}...")
-    
-    while True:
+    async def publish_post(self, post_data: dict) -> bool:
         try:
-            # Generate a post
-            post_data = generate_post()
-            
-            # Publish to Redis Stream
-            # maxlen=1000 prevents Redis from filling up memory forever
-            r.xadd(STREAM_NAME, post_data, maxlen=10000)
-            
-            print(f"Published post: {post_data['post_id']} ({post_data['source']})")
-            
-            # Rate limiting: 1 post every 0.5 to 2 seconds
-            time.sleep(random.uniform(0.5, 2.0))
-            
+            await self.redis.xadd(self.stream_name, post_data)
+            return True
         except Exception as e:
-            print(f"Error publishing post: {e}")
-            time.sleep(5)
+            print(f"❌ Redis Error: {e}")
+            return False
+
+    async def start(self, duration_seconds: int = None):
+        interval = 60.0 / self.posts_per_minute
+        start_time = time.time()
+        
+        while True:
+            if duration_seconds and (time.time() - start_time) > duration_seconds:
+                break
+            
+            post = self.generate_post()
+            await self.publish_post(post)
+            await asyncio.sleep(interval)
+
+async def main():
+    host = os.getenv("REDIS_HOST", "redis")
+    client = redis.Redis(host=host, port=6379, decode_responses=True)
+    stream = os.getenv("REDIS_STREAM_NAME", "social_posts_stream")
+    ppm = int(os.getenv("INGESTION_RATE", 60))
+    
+    ingester = DataIngester(client, stream, posts_per_minute=ppm)
+    await ingester.start()
 
 if __name__ == "__main__":
-    # Wait for Redis to be ready (simple retry)
-    time.sleep(5) 
-    start_ingestion()
+    asyncio.run(main())
